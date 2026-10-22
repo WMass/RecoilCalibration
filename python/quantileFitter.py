@@ -19,11 +19,78 @@ import hist
 import boost_histogram as bh
 import baseFunctions as rfb
 import narf
+import wums.fitutils
+import wums.tfutils
 
 from scipy.optimize import curve_fit
+import scipy.optimize
 import boostHistHelpers as bhh
 
 np.set_printoptions(threshold=sys.maxsize)
+
+
+def polish_fit(bhist, func, parmvals, norm_axes=None, func_constraint=None, args=(), args_constraint=(), edmtol=0.1, maxiter=1000, max_attempts=3):
+    """
+    Minimize the same binned likelihood as wums.fitutils.fit_hist (mode nll_bin_integrated) with scipy's trust-exact
+    method, which uses the full hessian, starting from parmvals. For fits where trust-krylov stops before reaching
+    the minimum. Returns the same dictionary as fit_hist.
+    """
+    dtype = tf.float64
+    xvals = [tf.constant(c, dtype=dtype) for c in bhist.axes.centers]
+    xwidths = [tf.constant(w, dtype=dtype) for w in bhist.axes.widths]
+    xedges = [tf.constant(e, dtype=dtype) for e in bhist.axes.edges]
+    yvals = tf.constant(bhist.values(), dtype=dtype)
+    yvariances = tf.constant(bhist.variances(), dtype=dtype)
+    val_grad_args = {
+        "func_loss": wums.fitutils.nll_loss_bin_integrated,
+        "func_constraint": func_constraint,
+        "args_loss": (xvals, xwidths, xedges, yvals, yvariances, func, norm_axes),
+        "extra_args_loss": args,
+        "args_constraint": (xvals, xedges),
+        "extra_args_constraint": args_constraint,
+    }
+
+    cache = {}
+    def val_grad(x):
+        if cache.get("x_grad") is None or not np.array_equal(cache["x_grad"], x):
+            loss, grad = wums.fitutils.val_grad(wums.fitutils.loss_with_constraint, parms=tf.constant(x, dtype=dtype), **val_grad_args)
+            cache["x_grad"], cache["val_grad"] = np.copy(x), (loss.numpy(), grad.numpy())
+        return cache["val_grad"]
+
+    def hess(x):
+        _, _, h = wums.fitutils.val_grad_hess(wums.fitutils.loss_with_constraint, parms=tf.constant(x, dtype=dtype), **val_grad_args)
+        return h.numpy()
+
+    # the cdf is only once differentiable (pchip), so the minimization can stall near the minimum, restarting
+    # resets the trust region
+    x, nit = parmvals, 0
+    for attempt in range(max_attempts):
+        res = scipy.optimize.minimize(lambda x: val_grad(x)[0], x, method="trust-exact", jac=lambda x: val_grad(x)[1], hess=hess, options={"gtol": 1e-6, "maxiter": maxiter})
+        x, nit = res.x, nit + res.nit
+
+        loss, grad, h = wums.fitutils.val_grad_hess(wums.fitutils.loss_with_constraint, parms=tf.constant(x, dtype=dtype), **val_grad_args)
+        loss, grad, h = loss.numpy(), grad.numpy(), h.numpy()
+        eigvals = np.linalg.eigvalsh(h)
+        try:
+            edmval = 0.5 * grad @ np.linalg.solve(h, grad)
+            cov = np.linalg.inv(h)
+        except np.linalg.LinAlgError:
+            edmval, cov = 99., np.zeros_like(h)
+        if 0. <= edmval < edmtol and eigvals[0] > 0.:
+            break
+
+    return {
+        "x": x,
+        "hess": h,
+        "cov": cov,
+        "status": 0 if 0. <= edmval < edmtol else 1,
+        "covstatus": 0 if eigvals[0] > 0. else 1,
+        "hess_eigvals": eigvals,
+        "edmval": edmval,
+        "loss_val": loss,
+        "polish_message": res.message,
+        "polish_nit": nit,
+    }
 
 
 class QuantileFitter:
@@ -112,7 +179,7 @@ class QuantileFitter:
 
             edges =  tf.constant(tmp.axes[0].edges, dtype=self.dtype)
             centers =  tf.constant(tmp.axes[0].centers, dtype=self.dtype)
-            self.quant_cdfvals = quants = narf.fitutils.pchip_interpolate(edges, hist_cdfvals, centers)
+            self.quant_cdfvals = quants = wums.fitutils.pchip_interpolate(edges, hist_cdfvals, centers)
             
             self.quant_cdfvals = tf.concat([tf.constant([0], dtype=self.dtype), self.quant_cdfvals, tf.constant([1], dtype=self.dtype)], axis=0) # 53 add 0
             
@@ -125,7 +192,7 @@ class QuantileFitter:
 
             edges =  tf.constant(tmp.axes[0].edges, dtype=self.dtype)
             centers =  tf.constant(tmp.axes[0].centers, dtype=self.dtype)
-            self.quant_cdfvals_hi = quants = narf.fitutils.pchip_interpolate(edges, hist_cdfvals, centers)
+            self.quant_cdfvals_hi = quants = wums.fitutils.pchip_interpolate(edges, hist_cdfvals, centers)
             
             self.quant_cdfvals_hi = tf.concat([tf.constant([0], dtype=self.dtype), self.quant_cdfvals_hi, tf.constant([1], dtype=self.dtype)], axis=0) # 53 add 0
             quantiles_hi = self.quant_cdfvals_hi.numpy()
@@ -206,7 +273,7 @@ class QuantileFitter:
             self.quant_cdfvals_tf = tf.constant(tmp, dtype=self.dtype)
 
         s = bh.tag.Slicer()
-        hist_quantiles, hist_quantiles_err = narf.fitutils.hist_to_quantiles(self.bhist_fit, self.quant_cdfvals_tf, axis=1)
+        hist_quantiles, hist_quantiles_err = wums.fitutils.hist_to_quantiles(self.bhist_fit, self.quant_cdfvals_tf, axis=1)
         ev_map = ROOT.TH2D("ev_map", "", self.nParams, 0, self.nParams, len(self.bins_qt)-1, 0, len(self.bins_qt)-1)
         for qTbin in range(0, len(self.bins_qt)-1):
             qT, qTlow, qThigh = self.centers_qt[qTbin], self.bins_qt[qTbin], self.bins_qt[qTbin+1]
@@ -265,7 +332,7 @@ class QuantileFitter:
 
     def setBackground(self, pkl_bkg, bhist_bkg, sf=1.):
         self.sub_bkg = True
-        bhist_bkg *= sf
+        bhist_bkg = bhist_bkg * sf # not in place, the input histogram is reused for other variations
         self.bhist_bkg_fit = self.rebin(bhist_bkg, self.qTRebin, self.recoilRebinFit)
         self.bhist_bkg_plt = self.rebin(bhist_bkg, self.qTRebin, self.recoilRebinPlt)
         #self.bhist_minus_bkg_fit = self.bhist_minus_bkg_fit + self.bhist_bkg_fit*(-1)
@@ -359,9 +426,9 @@ class QuantileFitter:
         y_vals_tf_err = [[] for i in range(0, self.nParams)]
 
         # compute CDF vals for the backgrounds
-        hist_quantiles, hist_quantiles_err = narf.fitutils.hist_to_quantiles(self.bhist_minus_bkg_fit, self.quant_cdfvals_tf, axis=1)
-        qparms, qparms_err =  narf.fitutils.quantiles_to_qparms(hist_quantiles, quant_errs=hist_quantiles_err, x_low=self.recoilMin, x_high=self.recoilMax, axis=1)
-        cdfvals =  narf.fitutils.qparms_to_quantiles(qparms, x_low=self.recoilMin, x_high=self.recoilMax, axis=1)
+        hist_quantiles, hist_quantiles_err = wums.fitutils.hist_to_quantiles(self.bhist_minus_bkg_fit, self.quant_cdfvals_tf, axis=1)
+        qparms, qparms_err =  wums.fitutils.quantiles_to_qparms(hist_quantiles, quant_errs=hist_quantiles_err, x_low=self.recoilMin, x_high=self.recoilMax, axis=1)
+        cdfvals =  wums.fitutils.qparms_to_quantiles(qparms, x_low=self.recoilMin, x_high=self.recoilMax, axis=1)
 
         for qTbin,quantiles in enumerate(hist_quantiles):
             qT, qTlow, qThigh = self.centers_qt[qTbin], self.bins_qt[qTbin], self.bins_qt[qTbin+1]
@@ -396,8 +463,8 @@ class QuantileFitter:
         outDict = {}
         outDict['x'] = np.empty(0) # nominal parameters of fit
 
-        qparms_val_init = narf.fitutils.cubic_spline_interpolate(self.edges_qt_tf, qparms, self.knots_qt, axis=0, extrpl=self.extrpl)
-        qparms_init = narf.fitutils.cubic_spline_interpolate(self.knots_qt, qparms_val_init, self.edges_qt_tf, axis=0, extrpl=self.extrpl)
+        qparms_val_init = wums.fitutils.cubic_spline_interpolate(self.edges_qt_tf, qparms, self.knots_qt, axis=0, extrpl=self.extrpl)
+        qparms_init = wums.fitutils.cubic_spline_interpolate(self.knots_qt, qparms_val_init, self.edges_qt_tf, axis=0, extrpl=self.extrpl)
         qparms_val_init_np = qparms_val_init.numpy().T
         qparms_init_np = qparms_init.numpy().T
 
@@ -494,8 +561,8 @@ class QuantileFitter:
         y_vals_tf_err = [[] for i in range(0, self.nParams)]
 
         # compute CDF vals for the backgrounds
-        hist_quantiles, hist_quantiles_err = narf.fitutils.hist_to_quantiles(self.bhist_minus_bkg_fit, self.quant_cdfvals_tf, axis=1) # , cdfvals_bkg=self.bkg_cdf 
-        qparms, qparms_err =  narf.fitutils.quantiles_to_qparms(hist_quantiles, quant_errs=hist_quantiles_err, x_low=self.recoilMin, x_high=self.recoilMax) # shape (qTbins, nQparms)
+        hist_quantiles, hist_quantiles_err = wums.fitutils.hist_to_quantiles(self.bhist_minus_bkg_fit, self.quant_cdfvals_tf, axis=1) # , cdfvals_bkg=self.bkg_cdf 
+        qparms, qparms_err =  wums.fitutils.quantiles_to_qparms(hist_quantiles, quant_errs=hist_quantiles_err, x_low=self.recoilMin, x_high=self.recoilMax) # shape (qTbins, nQparms)
 
         for qTbin,quantiles in enumerate(hist_quantiles):
             qT, qTlow, qThigh = self.centers_qt[qTbin], self.bins_qt[qTbin], self.bins_qt[qTbin+1]
@@ -536,7 +603,7 @@ class QuantileFitter:
             'ymaxR'             : yRatio,
         }
 
-        qparms_init = narf.fitutils.cubic_spline_interpolate(self.knots_qt, parms_postfit_tf, self.edges_qt_tf, axis=0, extrpl=self.extrpl)
+        qparms_init = wums.fitutils.cubic_spline_interpolate(self.knots_qt, parms_postfit_tf, self.edges_qt_tf, axis=0, extrpl=self.extrpl)
         qparms_init_np = qparms_init.numpy().T
 
         for i in range(0, self.nParams):
@@ -610,8 +677,8 @@ class QuantileFitter:
         y_vals_tf_err = [[] for i in range(0, self.nParams)]
         
         # compute CDF vals for the backgrounds
-        hist_quantiles, hist_quantiles_err = narf.fitutils.hist_to_quantiles(self.bhist_quants, self.quant_cdfvals_tf, axis=1) # , cdfvals_bkg=self.bkg_cdf 
-        qparms, qparms_err =  narf.fitutils.quantiles_to_qparms(hist_quantiles, quant_errs=hist_quantiles_err, x_low=self.recoilMin, x_high=self.recoilMax) # shape (qTbins, nQparms)
+        hist_quantiles, hist_quantiles_err = wums.fitutils.hist_to_quantiles(self.bhist_quants, self.quant_cdfvals_tf, axis=1) # , cdfvals_bkg=self.bkg_cdf 
+        qparms, qparms_err =  wums.fitutils.quantiles_to_qparms(hist_quantiles, quant_errs=hist_quantiles_err, x_low=self.recoilMin, x_high=self.recoilMax) # shape (qTbins, nQparms)
         
         for qTbin,quantiles in enumerate(hist_quantiles):
             qT, qTlow, qThigh = self.centers_qt[qTbin], self.bins_qt[qTbin], self.bins_qt[qTbin+1]
@@ -646,8 +713,8 @@ class QuantileFitter:
 
         if self.doSpline:
 
-            #qparms_val_init = narf.fitutils.pchip_interpolate(self.edges_qt_tf, qparms, self.qT_vals, axis=0) # (nKnots, nQuants)
-            #qparms_init = narf.fitutils.pchip_interpolate(self.qT_vals, qparms_val_init, self.edges_qt_tf, axis=0) # to visualize spline
+            #qparms_val_init = wums.fitutils.pchip_interpolate(self.edges_qt_tf, qparms, self.qT_vals, axis=0) # (nKnots, nQuants)
+            #qparms_init = wums.fitutils.pchip_interpolate(self.qT_vals, qparms_val_init, self.edges_qt_tf, axis=0) # to visualize spline
             #qparms_init_np = qparms_init.numpy().T
             
             qparms_val_init = rfb.CubicSpline.cubic_spline_interpolate_tf(self.edges_qt_tf, qparms, self.qT_vals, axis=0) # (nKnots, nQuants)
@@ -699,7 +766,7 @@ class QuantileFitter:
                     #splines_val_init = rfb.CubicSpline.cubic_spline_interpolate_test(x_vals, y_vals[i], self.qT_vals_np)
                     #func_eval = rfb.CubicSpline.cubic_spline_interpolate_test(self.qT_vals_np, splines_val_init, x_vals)
        
-                    #qparms_init = narf.fitutils.pchip_interpolate(self.qT_vals, qparms_val_init, self.edges_qt_tf) # to visualize spline
+                    #qparms_init = wums.fitutils.pchip_interpolate(self.qT_vals, qparms_val_init, self.edges_qt_tf) # to visualize spline
                     #qparms_init_np = qparms_init.numpy().T
             
                 g_fit = self.makeTGraph(x_vals, func_eval, style="line")
@@ -865,7 +932,8 @@ class QuantileFitter:
             canvas.Draw()
             canvas.SaveAs("%s/q%d.png" % (outDir, i))
             canvas.SaveAs("%s/q%d.pdf" % (outDir, i))
-            canvas.Delete()                  
+            ROOT.SetOwnership(canvas, False) # deleted here, not again by python
+            canvas.Delete()
 
 
 
@@ -881,8 +949,8 @@ class QuantileFitter:
         y_vals_tf_err = [[] for i in range(0, self.nParams)]
 
         # compute CDF vals for the backgrounds
-        hist_quantiles, hist_quantiles_err = narf.fitutils.hist_to_quantiles(self.bhist_minus_bkg_fit, self.quant_cdfvals_tf, axis=1) # , cdfvals_bkg=self.bkg_cdf 
-        qparms, qparms_err =  narf.fitutils.quantiles_to_qparms(hist_quantiles, quant_errs=hist_quantiles_err, x_low=self.recoilMin, x_high=self.recoilMax) # shape (qTbins, nQparms)
+        hist_quantiles, hist_quantiles_err = wums.fitutils.hist_to_quantiles(self.bhist_minus_bkg_fit, self.quant_cdfvals_tf, axis=1) # , cdfvals_bkg=self.bkg_cdf 
+        qparms, qparms_err =  wums.fitutils.quantiles_to_qparms(hist_quantiles, quant_errs=hist_quantiles_err, x_low=self.recoilMin, x_high=self.recoilMax) # shape (qTbins, nQparms)
 
         for qTbin,quantiles in enumerate(hist_quantiles):
             qT, qTlow, qThigh = self.centers_qt[qTbin], self.bins_qt[qTbin], self.bins_qt[qTbin+1]
@@ -978,10 +1046,11 @@ class QuantileFitter:
             canvas.Draw()
             canvas.SaveAs(f"{outDir}/knot_{iKnot}.png")
             canvas.SaveAs(f"{outDir}/knot_{iKnot}.pdf")
+            ROOT.SetOwnership(canvas, False) # deleted here, not again by python
             canvas.Delete()
 
 
-    def fit(self, withConstraint=False, parms=[], ext=""):
+    def fit(self, withConstraint=False, parms=[], ext="", polish_only=False):
         self.logging.info("Start fit")
         outDir = f"{self.plotDir}/quantiles_refit/"
         utils.mkdir(outDir, True)
@@ -1000,10 +1069,20 @@ class QuantileFitter:
             parms_prefit = parms
 
         start = time.time()
-        if withConstraint:
-            res = narf.fitutils.fit_hist(self.bhist_fit, self.func_model, parms_prefit, mode="nll_bin_integrated", norm_axes=[1], edmtol=0.1, args=fit_args, func_constraint=self.func_constraint, args_constraint=fit_args)
+        res = None
+        if polish_only:
+            pass
+        elif withConstraint:
+            res = wums.fitutils.fit_hist(self.bhist_fit, self.func_model, parms_prefit, mode="nll_bin_integrated", norm_axes=[1], edmtol=0.1, args=fit_args, func_constraint=self.func_constraint, args_constraint=fit_args)
         else:
-            res = narf.fitutils.fit_hist(self.bhist_fit, self.func_model, parms_prefit, mode="nll_bin_integrated", norm_axes=[1], edmtol=0.1, args=fit_args)
+            res = wums.fitutils.fit_hist(self.bhist_fit, self.func_model, parms_prefit, mode="nll_bin_integrated", norm_axes=[1], edmtol=0.1, args=fit_args)
+
+        # trust-krylov can stop before the minimum, continue constrained fits (no null directions) with trust-exact
+        if withConstraint and (res is None or res['status'] != 0 or res['covstatus'] != 0):
+            if res is not None:
+                self.logging.info(" -> fit_hist ended with status={}, cov_status={}, edm={:.3e}, continue with trust-exact".format(res['status'], res['covstatus'], res['edmval']))
+            res = polish_fit(self.bhist_fit, self.func_model, parms_prefit if res is None else res['x'], norm_axes=[1], func_constraint=self.func_constraint, args=fit_args, args_constraint=fit_args, edmtol=0.1)
+            self.logging.info(" -> trust-exact: {} after {} iterations".format(res['polish_message'], res['polish_nit']))
         end = time.time()
 
         parms_vals = res['x']
@@ -1013,7 +1092,7 @@ class QuantileFitter:
         cov_matrix = res['cov']
         edmval = res['edmval']
         hess = res['hess']
-        
+        self.cov_matrix = cov_matrix
         if not withConstraint:
             hess_eigvals_trunc = hess_eigvals[self.order:] # remove first N DOF
             cov_status_trunc = 1
@@ -1066,51 +1145,65 @@ class QuantileFitter:
 
         return parms_vals
 
-    def ratioHist_tgraph(self, hNom, hRatio, pdf, xMin=-9e99, xMax=9e99):
+    def ratioHist_tgraph(self, hNom, hRatio, pdf_values, pdf_sigmas, xMin=-9e99, xMax=9e99,):
 
-        chi2 = 0
-        nBins = 0
+        hist_pdf = hNom.Clone("hist_pdf")
         for i in range(1, hRatio.GetNbinsX()+1):
-                
+            x = hRatio.GetBinCenter(i)
             xLow , xHigh = hRatio.GetBinLowEdge(i), hRatio.GetBinLowEdge(i+1)
             if xLow > xMax:
                 continue
             if xHigh < xMin:
                 continue
-            pdfLow, pdfHigh = pdf.Eval(xLow), pdf.Eval(xHigh)
-            pdfVal = 0.5*(pdfLow + pdfHigh)
-            pdfVal = pdf.Eval(hRatio.GetBinCenter(i))
-            y, y_err = 0, 0
-            if(pdfVal > 0): 
-                y = hNom.GetBinContent(i)/pdfVal
-                y_err = hNom.GetBinError(i)/hNom.GetBinContent(i) if hNom.GetBinContent(i) > 0 else 0
+
+            pdfVal = pdf_values[i-1]/(self.bins_recoil_plt[i]-self.bins_recoil_plt[i-1])
+            pdfErr = pdf_sigmas[i-1]/(self.bins_recoil_plt[i]-self.bins_recoil_plt[i-1]) if len(pdf_sigmas) > 0 else 0
+            y = hNom.GetBinContent(i)/pdfVal
+            y_err = hNom.GetBinError(i)/hNom.GetBinContent(i) if hNom.GetBinContent(i) > 0 else 0
             hRatio.SetBinContent(i, y)
-            hRatio.SetBinError(i, y_err)
-        
+            hRatio.SetBinError(i, y_err) # datapoint error
+
+            # only fill PDF when data is present in bin (neglect for chi2)
             if hNom.GetBinContent(i) > 0:
-                chi2 += (((pdfVal - hNom.GetBinContent(i)) / hNom.GetBinError(i)) ** 2)
-                nBins += 1
-                
-        chi2 /= nBins      
-        return chi2, hRatio
+                hist_pdf.SetBinContent(i, pdfVal)
+                hist_pdf.SetBinError(i, pdfErr)
+
+        pval_chi2 = hist_pdf.Chi2Test(hNom, "WW")*100. # UU changes the NDF
+        chi2 = hist_pdf.Chi2Test(hNom, "WW CHI2") # UU changes the NDF
+        chndof = hist_pdf.Chi2Test(hNom, "WW CHI2/NDF") # UU changes the NDF
+        ndof = chi2 / chndof
+
+        pval_KS = hist_pdf.KolmogorovTest(hNom)*100.
+        pval_AD = hist_pdf.AndersonDarlingTest(hNom)*100.
+ 
+        #print(chndof, pval_chi2, pval_KS, pval_AD)
+        #quit()
+        if math.isnan(chi2) or math.isnan(chndof) or math.isnan(ndof):
+            return -1, -1, -1, -1, -1, hRatio
+        return chi2, ndof, pval_chi2, pval_KS, pval_AD, hRatio
    
 
     def pdf(self, parms, fit_args, xvals=[], edges=[]):
+        #print("parms", parms[100])
+        #parms[100] = 0
         tfparms = tf.constant(parms, dtype=self.dtype)
         if len(xvals) == 0 and len(edges) == 0:
             cdf = self.func_model(self.xvals_plt, self.xedges_plt, tfparms, *fit_args)
         else:
             cdf = self.func_model(xvals, edges, tfparms, *fit_args)
+
         pdf = cdf[:,1:] - cdf[:,:-1]
         pdf = tf.maximum(pdf, tf.zeros_like(pdf))
-        
+
         # normalize the recoil PDF in each qT bin 
         # PDF is already normalized in each qT bin
         norms = np.sum(pdf, axis=1)
         norms[norms == 0] = 1 # avoid division by zero
         pdf = pdf / norms[:, np.newaxis]
+        #print("pdf", pdf[0])
         return pdf
-        
+
+
     def plot_refit_quantiles(self, prefit=False, yRatio=1.15, logY=True, yMin=-1, yMax=-1, xMin=-1, xMax=-1, ext=""):
 
         rebin = 1
@@ -1118,9 +1211,14 @@ class QuantileFitter:
 
         xMin = self.recoilMin if xMin == -1 else xMin
         xMax = self.recoilMax if xMax == -1 else xMax
-
+        
+        cov_status = -1
+        fit_status = -1
+        parms_unc = []
+        doStat = True
         if ext == "":
             if prefit:
+                doStat = False
                 self.logging.info("Plot prefit")
                 outDir = f"{self.plotDir}/pdf_prefit"
 
@@ -1136,24 +1234,31 @@ class QuantileFitter:
                 pkl = pickle.load(fIn)
                 hess = pkl['hess']
                 parms_nom = pkl['x']
+                cov_status = pkl['covstatus']
+                fit_status = pkl['status']
 
-                eigvals = np.linalg.eigvalsh(hess)
-                n_zeros = (0 if pkl['withConstraint'] else self.order)
+                if cov_status != 0:
+                    doStat = False
 
+                if doStat:
+                    n_zeros = (0 if pkl['withConstraint'] else self.order)
+                    #eigenvalues, eigenvectors = self.get_eigenvectors(hess, num_null=n_zeros)
+                    #eig_vals, eig_vec = np.linalg.eigh(hess) # sorted
+                    #eig_vec = np.delete(eig_vec, list(range(0, n_zeros)), axis=1) # remove first order+1 vectors
+                    #eig_vals = np.delete(eig_vals, list(range(0, n_zeros)), axis=0) # remove first order+1 vectors
+                    #eig_vals, eig_vec = self.get_eigenvectors(hess, num_null=n_zeros)
+                    #eig_vals, eig_vec = np.linalg.eigh(hess) # sorted
+                    #variances = np.reciprocal(np.sqrt(eig_vals)) # diag space # (1, 250)
 
-                #eigenvalues, eigenvectors = self.get_eigenvectors(hess, num_null=n_zeros)
-                eig_vals, eig_vec = np.linalg.eigh(hess) # sorted
-                eig_vec = np.delete(eig_vec, list(range(0, n_zeros)), axis=1) # remove first order+1 vectors
-                eig_vals = np.delete(eig_vals, list(range(0, n_zeros)), axis=0) # remove first order+1 vectors
-                variances = np.reciprocal(np.sqrt(eig_vals)) # diag space
+                    eig_vals, eig_vec = np.linalg.eigh(self.cov_matrix) # sorted
+                    variances = np.sqrt(eig_vals)
 
-                sigma = 1
-                parms_unc = []
-                for iPert, var in enumerate(variances):
-                    var_pert = sigma*(np.array([0. if iPert != k else val for k,val in enumerate(variances)]))
-                    var = eig_vec @ var_pert
-                    parms_pert = list(parms_nom + var)
-                    parms_unc.append(parms_pert)
+                    sigma = 1
+                    for iPert, var in enumerate(variances):
+                        var_pert = sigma*(np.array([0. if iPert != k else val for k,val in enumerate(variances)]))
+                        var = eig_vec @ var_pert
+                        parms_pert = list(parms_nom + var)
+                        parms_unc.append(parms_pert)
         else:
             prefit = True
             outDir = f"{self.plotDir}/pdf_ext"
@@ -1178,40 +1283,31 @@ class QuantileFitter:
 
         # get the nominal pdf
         fit_args = (self.quant_cdfvals_tf, self.knots_qt, self.edges_qt_tf, self.order, self.extrpl, self.bkg_cdf_plt, self.scale_sf_sig_plt, self.scale_sf_bkg_plt)
-        
         pdf = self.pdf(parms_nom, fit_args)
-        
+       
         if plotSignal:
             fit_args_sig = (self.quant_cdfvals_tf, self.knots_qt, self.edges_qt_tf, self.order, self.extrpl, None, None, None)
             pdf_sig = self.pdf(parms_nom, fit_args_sig)
 
-        # get uncertainty band (denser grid)
-        if not prefit and False:
-            pdf_stat = None
+        # sum all uncertainty in quadrature get uncertainty band (denser grid)
+        if doStat:
+            pdf_stat_variances = None
             nrecbins_stat = 200+1
             lspace = np.linspace(min(self.bins_recoil_plt), max(self.bins_recoil_plt), num=nrecbins_stat)
             xvals_plot_unc = copy.deepcopy(self.xvals_plt)
             edges_plot_unc = copy.deepcopy(self.xedges_plt)
             xvals_plot_unc[1] = tf.constant((lspace[1:] + lspace[:-1]) / 2, dtype=self.dtype) # midpoints
             edges_plot_unc[1] = tf.constant(lspace, dtype=self.dtype)[None, :]
-            pdf_nom_stat = self.pdf(parms_nom, fit_args, xvals=xvals_plot_unc, edges=edges_plot_unc)
+            #pdf_nom_stat = self.pdf(parms_nom, fit_args, xvals=xvals_plot_unc, edges=edges_plot_unc)
 
-            for istat, punc in enumerate(parms_unc):
-                #if istat == 1:
-                #    continue
-                pdf_pert = self.pdf(punc, fit_args, xvals=xvals_plot_unc, edges=edges_plot_unc)
-                pdf_dpert = (pdf_nom_stat - pdf_pert)#**2
-                pdf_dpert = (pdf_nom_stat/pdf_pert)#**2
-                print(pdf_nom_stat[3])
-                print(pdf_pert[3])
-                print(pdf_dpert[3])
-                quit()
-                if pdf_stat == None:
-                    pdf_stat = pdf_dpert
-                else:
-                    np.add(pdf_stat, pdf_dpert)
-            pdf_stat = np.sqrt(pdf_stat) / pdf_nom_stat
-            stat_unc = [0]*len(lspace) # total stat uncertainty on the sum
+            pdf_stat_variances = np.zeros_like(pdf)
+            for istat, parms_pert in enumerate(parms_unc): # add all unc in quadrature
+                #pdf_pert = self.pdf(parms_pert, fit_args, xvals=xvals_plot_unc, edges=edges_plot_unc)
+                pdf_pert = self.pdf(parms_pert, fit_args)
+                pdf_dpert = np.square(pdf - pdf_pert)
+                pdf_stat_variances = np.add(pdf_stat_variances, pdf_dpert)
+            pdf_stat = np.sqrt(pdf_stat_variances) + pdf # / pdf_nom_stat
+
 
         cfgPlot = {
 
@@ -1223,7 +1319,7 @@ class QuantileFitter:
             'ymin'              : yMin,
             'ymax'              : yMax,
 
-            'xtitle'            : "Recoil U_{#perp}   (GeV)" if self.comp == "perp" else "Recoil U_{#parallel} (GeV)",
+            'xtitle'            : "Recoil U_{#perp}   (GeV)" if self.comp == "perp" else "Recoil U_{#parallel} #plus q_{T} (GeV)",
             'ytitle'            : "Events" ,
 
             'topRight'          : self.lumiLabel, 
@@ -1238,11 +1334,14 @@ class QuantileFitter:
         
 
         g_chi2 = ROOT.TGraphErrors()
+        g_pchi2 = ROOT.TGraphErrors()
+        g_pks = ROOT.TGraphErrors()
         hist_root_tot = None
         pdf_tot, sig_pdf_tot = [0]*len(self.centers_recoil_plt), [0]*len(self.centers_recoil_plt)
         yields, yields_err, pdf_fracs = [], [], []
 
         yield_tot = self.bhist_plt.sum().value
+        hist_root_tot_unc_ratio = None
         for qTbin in range(0, len(self.bins_qt)-1):
             qT, qTlow, qThigh = self.centers_qt[qTbin], self.bins_qt[qTbin], self.bins_qt[qTbin+1]
             h = self.qTslice(self.bhist_plt, qTlow, qThigh)
@@ -1254,22 +1353,11 @@ class QuantileFitter:
 
             pdf_values = pdf[qTbin,:] # is normalized (or should be)
             pdf_values *= h.sum().value/np.sum(pdf_values) # renormalize PDF in each qT bin
-            
+
             if plotSignal:
                 h_bkg = self.qTslice(self.bhist_bkg_plt, qTlow, qThigh)
                 pdf_sig_values = pdf_sig[qTbin,:] # is normalized (or should be)
                 pdf_sig_values *= (h.sum().value-h_bkg.sum().value)/np.sum(pdf_sig_values) # renormalize PDF in each qT bin
-       
-            if not prefit and False:
-                pdf_values_unc = pdf_stat[qTbin,:]
-                print("lol")
-                w = yield_ / yield_tot
-                for k,val in enumerate(pdf_values_unc):
-                    stat_unc[k] += val*val
-                    #if qTbin == 0:
-                    #    print(val, w)
-            #pdf_frac_range = sum(pdf_values)
-            #pdf_fracs.append(pdf_frac_range)
 
             hist_root = narf.hist_to_root(h)
             #hist_root.Scale(1.0, "width")
@@ -1286,97 +1374,50 @@ class QuantileFitter:
                 if yMin < 0:
                     cfgPlot['ymin'] = math.pow(10., math.floor(math.log10(utils.getNonZeroMinimum(hist_root, xMin=xMin, xMax=xMax)))-1)
                 if yMax < 0:
-                    cfgPlot['ymax'] = math.pow(10., math.ceil(math.log10(hist_root.GetMaximum()))+3)
+                    cfgPlot['ymax'] = math.pow(10., math.ceil(math.log10(hist_root.GetMaximum()))+4)
             else:
                 cfgPlot['ymin'] = 0
                 cfgPlot['ymax'] = 1.75*hist_root.GetMaximum()
 
-            if not prefit and False:
-                hist_root_tot_unc_ = hist_root.Clone("hist_root_tot_unc_%d"%qTbin)
-                hist_root_tot_unc_.SetFillColor(18)
-                hist_root_tot_unc_.SetMarkerSize(0)
-                hist_root_tot_unc_.SetLineWidth(0)
-                hist_root_tot_unc_.Reset("ICE")
-                hist_root_tot_unc_.ResetStats() 
-                
+            pdf_sigmas = []
+            if doStat:
                 hist_root_tot_unc_ratio_ = hist_root.Clone("hist_root_tot_unc_ratio_%d"%qTbin)
                 hist_root_tot_unc_ratio_.SetFillColor(18)
                 hist_root_tot_unc_ratio_.SetMarkerSize(0)
                 hist_root_tot_unc_ratio_.SetLineWidth(0)
                 hist_root_tot_unc_ratio_.Reset("ICE") # reset errors
-                hist_root_tot_unc_ratio_.ResetStats() 
-                
-                pdf_pert_tot = None
-                for nStat in range(0, nStatVars):
-                
-                    pdf_values = tf.math.pow(pdf_stat[nStat][qTbin,:], 2)
-                    if pdf_pert_tot == None:
-                        pdf_pert_tot = pdf_values
-                    else:
-                        pdf_pert_tot += pdf_values
-                
+                hist_root_tot_unc_ratio_.ResetStats()
 
-                if True:
-                    ### PLUS VARIATION
-                    pdf_tot_var_up = [0]*len(centers_recoil)
-                    nStatName = "stat%d_p" % nStat
-                    func_parms_p = []
-                    for k in range(0, fitCfg['nParams']):
-                        for l in range(0, fitCfg["p%d"%k]['nParams']):
-                            func_parms_p.append(fitCfg[nStatName]["p%d"%k]["p%d"%l])
-                           
-                    if average_eval_PDF:
-                        pdf_values_var_bins = func_model([qT_tf, bins_recoil_tf], func_parms_p, *args).numpy()
-                        pdf_values_var = [0.5*(pdf_values_var_bins[i-1]+pdf_values_var_bins[i]) for i in range(1, len(pdf_values_var_bins))]
-                    else:
-                        pdf_values_var = func_model([qT_tf, centers_recoil_tf], func_parms_p, *args).numpy()
+                hist_root_tot_unc_ = hist_root.Clone("hist_root_tot_unc_%d"%qTbin)
+                hist_root_tot_unc_.SetFillColor(18)
+                hist_root_tot_unc_.SetMarkerSize(0)
+                hist_root_tot_unc_.SetLineWidth(0)
+                hist_root_tot_unc_.Reset("ICE") # reset errors
+                hist_root_tot_unc_.ResetStats()
 
-                    for i in range(0, len(centers_recoil)): 
-                        pdf_tot_var_up[i] += pdf_values_var[i]*yields[qTbin-1]/pdf_fracs[qTbin-1] # iBin starts from 1
-                             
-                    
-                    ### MINUS VARIATION
-                    pdf_tot_var_dw = [0]*len(centers_recoil)
-                    nStatName = "stat%d_m" % nStat
-                    func_parms_m = []
-                    for k in range(0, fitCfg['nParams']):
-                        for l in range(0, fitCfg["p%d"%k]['nParams']):
-                            func_parms_m.append(fitCfg[nStatName]["p%d"%k]["p%d"%l])
-                     
-                    if average_eval_PDF:
-                        pdf_values_var_bins = func_model([qT_tf, bins_recoil_tf], func_parms_m, *args).numpy()
-                        pdf_values_var = [0.5*(pdf_values_var_bins[i-1]+pdf_values_var_bins[i]) for i in range(1, len(pdf_values_var_bins))]
-                    else:
-                        pdf_values_var = func_model([qT_tf, centers_recoil_tf], func_parms_m, *args).numpy()
-
-                    for i in range(0, len(centers_recoil)): 
-                        pdf_tot_var_dw[i] += pdf_values_var[i]*yields[qTbin-1]/pdf_fracs[qTbin-1] # iBin starts from 1     
-                    
-                    # make average of plus and minus variation  
-                    for i in range(1, hist_root_tot_unc_ratio_.GetNbinsX()+1):
-                        pdf_tot_eval = pdf_values[i-1]*yield_/pdf_frac_range
-                        if pdf_tot_eval > 0:
-                            err_up = abs(pdf_tot_var_up[i-1] - pdf_tot_eval)
-                            err_dw = abs(pdf_tot_eval - pdf_tot_var_dw[i-1])
-                            err = abs(0.5*(err_up+err_dw))
-                        else:
-                            err = 0
-                        hist_root_tot_unc_ratio_.SetBinError(i, hist_root_tot_unc_ratio_.GetBinError(i) + err*err) # add in quadrature
-                        hist_root_tot_unc_.SetBinError(i, hist_root_tot_unc_.GetBinError(i) + err*err)
-
-                for i in range(1, hist_root_tot_unc_ratio_.GetNbinsX()+1): 
-                    pdf_tot_eval = pdf_values[i-1]*yield_/pdf_frac_range
-                    if pdf_tot_eval > 0: 
-                        hist_root_tot_unc_ratio_.SetBinError(i, (hist_root_tot_unc_ratio_.GetBinError(i)**0.5)/pdf_tot_eval)
-                        hist_root_tot_unc_.SetBinError(i, hist_root_tot_unc_.GetBinError(i)**0.5)
+                pdf_stat_values = pdf_stat[qTbin,:]
+                pdf_stat_values *= h.sum().value/np.sum(pdf_stat_values)
+                for i in range(1, hist_root_tot_unc_ratio_.GetNbinsX()+1):
+                    yld_nom = float(pdf_values[i-1])
+                    yld_var = float(pdf_stat_values[i-1])
                     hist_root_tot_unc_ratio_.SetBinContent(i, 1)
-                    hist_root_tot_unc_.SetBinContent(i, pdf_tot_eval)
-     
+                    hist_root_tot_unc_ratio_.SetBinError(i, (yld_var-yld_nom)/yld_nom)
 
+                    sf = (self.bins_recoil_plt[i]-self.bins_recoil_plt[i-1])
+                    hist_root_tot_unc_.SetBinContent(i, yld_nom/sf)
+                    hist_root_tot_unc_.SetBinError(i, (yld_var-yld_nom)/sf)
+
+                    pdf_sigmas.append(yld_var-yld_nom)
+
+                if hist_root_tot_unc_ratio == None:
+                    hist_root_tot_unc_ratio = hist_root_tot_unc_.Clone("hist_root_tot_unc_ratio")
+                else:
+                    hist_root_tot_unc_ratio.Add(hist_root_tot_unc_)
+                #quit()
             plotter.cfg = cfgPlot
             canvas, padT, padB = plotter.canvasRatio()
             dummyT, dummyB, dummyL = plotter.dummyRatio(line=1)
-            
+
             canvas.cd()
             padT.Draw()
             padT.cd()
@@ -1384,9 +1425,11 @@ class QuantileFitter:
             padT.SetTickx()
             padT.SetTicky()
             dummyT.Draw("HIST")
-            
+
+            if doStat:
+                hist_root_tot_unc_.Draw("E4 SAME")
+
             hist_root.Draw("PE SAME")
-            
 
             yield_ /= rebin # reduce yield to accomodate for binning
             g_pdf = ROOT.TGraphErrors()
@@ -1394,11 +1437,11 @@ class QuantileFitter:
             for i in range(0, len(self.centers_recoil_plt)): 
                 #g_pdf.SetPoint(i, self.centers_recoil[i], pdf_values[i]*yield_/pdf_frac_range)
                 g_pdf.SetPoint(i, self.centers_recoil_plt[i], pdf_values[i]/(self.bins_recoil_plt[i+1]-self.bins_recoil_plt[i]))
-                pdf_tot[i] += pdf_values[i]/(self.bins_recoil_plt[i+1]-self.bins_recoil_plt[i]) #*yield_ #/pdf_frac_range
+                pdf_tot[i] += pdf_values[i] #*yield_ #/pdf_frac_range
                 if plotSignal:
                     sig_pdf_tot[i] += pdf_sig_values[i]/(self.bins_recoil_plt[i+1]-self.bins_recoil_plt[i]) #*yield_ #/pdf_frac_range
 
-            
+
             g_pdf.SetLineColor(ROOT.kRed)
             g_pdf.SetLineWidth(3)
             g_pdf.Draw("L SAME")
@@ -1410,8 +1453,8 @@ class QuantileFitter:
             histRatio.SetMarkerColor(ROOT.kBlack)
             histRatio.SetLineColor(ROOT.kBlack)
             histRatio.SetLineWidth(1)
-            chi2, histRatio = self.ratioHist_tgraph(hist_root, histRatio, g_pdf, xMin=xMin, xMax=xMax)
-            
+            chi2, ndof, pval_chi2, pval_KS, pval_AD, histRatio = self.ratioHist_tgraph(hist_root, histRatio, pdf_values, pdf_sigmas, xMin=xMin, xMax=xMax)
+
 
             latex = ROOT.TLatex()
             latex.SetNDC()
@@ -1424,9 +1467,13 @@ class QuantileFitter:
             latex.DrawLatex(0.20, 0.70, "Mean = %.3f #pm %.3f" % (hist_root.GetMean(), hist_root.GetMeanError()))
             latex.DrawLatex(0.20, 0.65, "RMS = %.3f #pm %.3f" % (hist_root.GetRMS(), hist_root.GetRMSError()))
             latex.DrawLatex(0.20, 0.60, "Yield = %.3f #pm %.3f" % (yield_, yield_err))
-            latex.DrawLatex(0.20, 0.55, "#chi^{2}/ndof = %.3f" % chi2)
 
-            
+            latex.DrawLatex(0.60, 0.85, "Fit/Cov status = %d/%d" % (fit_status, cov_status))
+            latex.DrawLatex(0.60, 0.80, "#chi^{2}/ndof = %.3f/%d = %.3f" % (chi2, ndof, chi2/ndof))
+            latex.DrawLatex(0.60, 0.75, "p-value #chi^{2} = %.1f %%" % pval_chi2)
+            latex.DrawLatex(0.60, 0.70, "p-value KS = %.1f %%" % pval_KS)
+            #latex.DrawLatex(0.60, 0.70, "p-value AD = %.1f %%" % pval_AD)
+
             padT.RedrawAxis()
             padT.RedrawAxis("G")
             plotter.auxRatio()
@@ -1437,6 +1484,8 @@ class QuantileFitter:
             padB.SetTickx()
             padB.SetTicky()
             dummyB.Draw("HIST")
+            if doStat:
+                hist_root_tot_unc_ratio_.Draw("E4 SAME")
             dummyL.Draw("SAME")
             histRatio.Draw("SAME E0")
             padB.RedrawAxis()
@@ -1446,26 +1495,26 @@ class QuantileFitter:
             canvas.Draw()
             canvas.SaveAs("%s/%03d_recoil.png" % (outDir, qTbin))
             canvas.SaveAs("%s/%03d_recoil.pdf" % (outDir, qTbin))
+            ROOT.SetOwnership(dummyB, False) # deleted here, not again by python
             dummyB.Delete()
+            ROOT.SetOwnership(dummyT, False) # deleted here, not again by python
             dummyT.Delete()
+            ROOT.SetOwnership(padT, False) # deleted here, not again by python
             padT.Delete()
+            ROOT.SetOwnership(padB, False) # deleted here, not again by python
             padB.Delete()
-            #g_chi2.SetPoint(iBin-1, qT, chi2)
-            
+            g_chi2.SetPoint(qTbin, qT, chi2/ndof)
+            g_pchi2.SetPoint(qTbin, qT, pval_chi2)
+            g_pks.SetPoint(qTbin, qT, pval_KS)
 
-        
-        if not prefit and False:
-            hist_root_tot_unc_ratio = ROOT.TH1D("hist_root_tot_unc_ratio", "", nrecbins_stat, min(self.bins_recoil_plt), max(self.bins_recoil_plt))
+        if doStat:
             hist_root_tot_unc_ratio.SetFillColor(18)
             hist_root_tot_unc_ratio.SetMarkerSize(0)
             hist_root_tot_unc_ratio.SetLineWidth(0)
             for i in range(1, hist_root_tot_unc_ratio.GetNbinsX()+1):
-                hist_root_tot_unc_ratio.SetBinError(i, stat_unc[i-1]**0.5)
+                yld_nom = hist_root_tot_unc_ratio.GetBinContent(i)
+                hist_root_tot_unc_ratio.SetBinError(i, hist_root_tot_unc_ratio.GetBinError(i)/yld_nom)
                 hist_root_tot_unc_ratio.SetBinContent(i, 1)
-                print(stat_unc[i-1])
-            
-
-
 
 
         if logY:
@@ -1487,31 +1536,31 @@ class QuantileFitter:
         padT.SetTickx()
         padT.SetTicky()
         dummyT.Draw("HIST")
+
         hist_root_tot.SetLineColor(ROOT.kBlack)
         hist_root_tot.SetMarkerStyle(20)
         hist_root_tot.SetMarkerColor(ROOT.kBlack)
         hist_root_tot.SetLineColor(ROOT.kBlack)
         hist_root_tot.Draw("PE SAME")
-        
 
         g_pdf = ROOT.TGraphErrors()
         g_pdf.SetName("g_pdf")
         g_sig_pdf.SetName("g_sig_pdf")
         g_sig_pdf = ROOT.TGraphErrors()
         for i in range(0, len(self.centers_recoil_plt)): 
-            g_pdf.SetPoint(i, self.centers_recoil_plt[i], pdf_tot[i])
+            g_pdf.SetPoint(i, self.centers_recoil_plt[i], pdf_tot[i]/(self.bins_recoil_plt[i+1]-self.bins_recoil_plt[i]))
             if plotSignal:
                 g_sig_pdf.SetPoint(i, self.centers_recoil_plt[i], sig_pdf_tot[i])
         g_pdf.SetLineColor(ROOT.kRed)
         g_pdf.SetLineWidth(3)
-        
+
         if plotSignal:
             g_sig_pdf.SetLineColor(ROOT.kBlue)
             g_sig_pdf.SetLineWidth(3)
             g_sig_pdf.Draw("L SAME")
-        
+
         g_pdf.Draw("L SAME")
-            
+
         histRatio = hist_root_tot.Clone("ratio")
         histRatio.Reset("ACE")
         histRatio.SetMarkerStyle(8)
@@ -1519,8 +1568,7 @@ class QuantileFitter:
         histRatio.SetMarkerColor(ROOT.kBlack)
         histRatio.SetLineColor(ROOT.kBlack)
         histRatio.SetLineWidth(1)
-        chi2, histRatio = self.ratioHist_tgraph(hist_root_tot, histRatio, g_pdf, xMin=xMin, xMax=xMax)
-            
+        chi2, ndof, pval_chi2, pval_KS, pval_AD, histRatio = self.ratioHist_tgraph(hist_root_tot, histRatio, pdf_tot, [0]*len(pdf_tot), xMin=xMin, xMax=xMax)
 
         latex = ROOT.TLatex()
         latex.SetNDC()
@@ -1529,7 +1577,13 @@ class QuantileFitter:
         latex.SetTextFont(42)
         latex.DrawLatex(0.20, 0.85, self.procLabel)
         latex.DrawLatex(0.20, 0.80, self.metLabel)
-        latex.DrawLatex(0.20, 0.75, "#chi^{2}/ndof = %.3f" % chi2)
+        #latex.DrawLatex(0.20, 0.75, "#chi^{2}/ndof = %.3f/%d = %.3f" % (chi2, ndof, chi2/ndof))
+        
+        latex.DrawLatex(0.60, 0.85, "Fit/Cov status = %d/%d" % (fit_status, cov_status))
+        latex.DrawLatex(0.60, 0.80, "#chi^{2}/ndof = %.3f/%d = %.3f" % (chi2, ndof, chi2/ndof))
+        latex.DrawLatex(0.60, 0.75, "p-value #chi^{2} = %.1f %%" % pval_chi2)
+        latex.DrawLatex(0.60, 0.70, "p-value KS = %.1f %%" % pval_KS)
+        #latex.DrawLatex(0.60, 0.70, "p-value AD = %.1f %%" % pval_AD)
 
         padT.RedrawAxis()
         padT.RedrawAxis("G")
@@ -1541,7 +1595,7 @@ class QuantileFitter:
         padB.SetTickx()
         padB.SetTicky()
         dummyB.Draw("HIST")
-        if not prefit and False:
+        if doStat:
             hist_root_tot_unc_ratio.Draw("E4 SAME")
         dummyL.Draw("SAME")
         histRatio.Draw("SAME E0")
@@ -1552,10 +1606,131 @@ class QuantileFitter:
         canvas.Draw()
         canvas.SaveAs("%s/global.png" % outDir)
         canvas.SaveAs("%s/global.pdf" % outDir)
+        ROOT.SetOwnership(dummyB, False) # deleted here, not again by python
         dummyB.Delete()
+        ROOT.SetOwnership(dummyT, False) # deleted here, not again by python
         dummyT.Delete()
+        ROOT.SetOwnership(padT, False) # deleted here, not again by python
         padT.Delete()
+        ROOT.SetOwnership(padB, False) # deleted here, not again by python
         padB.Delete()
-   
-   
 
+
+
+       # plot the chi2
+        cfg_chi2 = {
+
+            'logy'              : False,
+            'logx'              : False,
+
+            'xmin'              : 0,
+            'xmax'              : self.bins_qt[-1],
+            'ymin'              : 0,
+            'ymax'              : 3,
+
+            'xtitle'            : "q_{T} (GeV)",
+            'ytitle'            : "#chi^{2}",
+
+            'topRight'          : self.lumiLabel, 
+            'topLeft'           : "#bf{CMS} #scale[0.7]{#it{Preliminary}}",
+
+        } 
+
+        g_chi2.SetLineColor(ROOT.kRed)
+        g_chi2.SetMarkerStyle(8)
+        g_chi2.SetMarkerSize(1)
+        g_chi2.SetMarkerColor(ROOT.kRed)
+
+        plotter.cfg = cfg_chi2
+        canvas = plotter.canvas()
+        canvas.SetGrid()
+        dummy = plotter.dummy()
+        canvas.cd()
+        dummy.Draw("HIST")
+        g_chi2.Draw("SAME LP")
+        plotter.aux()
+
+        latex = ROOT.TLatex()
+        latex.SetNDC()
+        latex.SetTextSize(0.035)
+        latex.SetTextColor(1)
+        latex.SetTextFont(42)
+        latex.DrawLatex(0.20, 0.90, self.procLabel)
+        latex.DrawLatex(0.20, 0.85, self.metLabel)
+
+        canvas.Modify()
+        canvas.Update()
+        canvas.Draw()
+        canvas.SaveAs("%s/chi2.png" % outDir)
+        canvas.SaveAs("%s/chi2.pdf" % outDir)
+        ROOT.SetOwnership(canvas, False) # deleted here, not again by python
+        canvas.Delete()
+        
+
+
+
+       # plot the p values
+        cfg_chi2 = {
+
+            'logy'              : False,
+            'logx'              : False,
+
+            'xmin'              : 0,
+            'xmax'              : self.bins_qt[-1],
+            'ymin'              : 0,
+            'ymax'              : 130,
+
+            'xtitle'            : "q_{T} (GeV)",
+            'ytitle'            : "p-value (%)",
+
+            'topRight'          : self.lumiLabel, 
+            'topLeft'           : "#bf{CMS} #scale[0.7]{#it{Preliminary}}",
+
+        } 
+
+
+        g_pchi2.SetLineColor(ROOT.kRed)
+        g_pchi2.SetMarkerStyle(8)
+        g_pchi2.SetMarkerSize(1)
+        g_pchi2.SetLineWidth(2)
+        g_pchi2.SetMarkerColor(ROOT.kRed)
+
+        g_pks.SetLineColor(ROOT.kBlue)
+        g_pks.SetMarkerStyle(8)
+        g_pks.SetMarkerSize(1)
+        g_pks.SetLineWidth(2)
+        g_pks.SetMarkerColor(ROOT.kBlue)
+        
+        leg = ROOT.TLegend(.60, 0.8, .95, .92)
+        leg.SetBorderSize(0)
+        leg.SetFillStyle(0)
+        leg.SetTextSize(0.03)
+        #leg.SetMargin(0.1)
+        #leg.AddEntry(g_pchi2, "P-value #chi^{2}", "LP")
+        leg.AddEntry(g_pks, "P-value KS", "LP")
+
+        plotter.cfg = cfg_chi2
+        canvas = plotter.canvas()
+        canvas.SetGrid()
+        dummy = plotter.dummy()
+        canvas.cd()
+        dummy.Draw("HIST")
+        #g_pchi2.Draw("SAME LP")
+        g_pks.Draw("SAME LP")
+        plotter.aux()
+
+        latex = ROOT.TLatex()
+        latex.SetNDC()
+        latex.SetTextSize(0.035)
+        latex.SetTextColor(1)
+        latex.SetTextFont(42)
+        latex.DrawLatex(0.20, 0.90, self.procLabel)
+        latex.DrawLatex(0.20, 0.85, self.metLabel)
+        leg.Draw()
+        canvas.Modify()
+        canvas.Update()
+        canvas.Draw()
+        canvas.SaveAs("%s/pval.png" % outDir)
+        canvas.SaveAs("%s/pval.pdf" % outDir)
+        ROOT.SetOwnership(canvas, False) # deleted here, not again by python
+        canvas.Delete()
